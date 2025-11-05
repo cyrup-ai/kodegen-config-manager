@@ -1,6 +1,6 @@
 [package]
 name = "kodegen_tools_config"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -18,9 +18,9 @@ keywords = [
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-kodegen_mcp_tool = { path = "../kodegen-mcp-tool" }
-kodegen_mcp_schema = { path = "../kodegen-mcp-schema" }
-kodegen_utils = { path = "../kodegen-utils" }
+kodegen_mcp_tool = { version = "0.1" }
+kodegen_mcp_schema = { version = "0.1" }
+kodegen_utils = { version = "0.1" }
 
 # MCP SDK - for Tool implementation and HTTP server (manual due to circular dependency with mcp-server-http)
 rmcp = { version = "0.8", features = ["client", "schemars", "server", "transport-streamable-http-server"]}
