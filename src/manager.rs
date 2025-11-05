@@ -20,6 +20,10 @@ fn default_http_connection_timeout_secs() -> u64 {
     5
 }
 
+fn default_path_validation_timeout_ms() -> u64 {
+    30_000  // 30 seconds (increased from hardcoded 10s)
+}
+
 // ============================================================================
 // PROFILING INSTRUMENTATION
 // ============================================================================
@@ -68,6 +72,11 @@ pub struct ServerConfig {
     /// HTTP connection timeout in seconds (default: 5)
     #[serde(default = "default_http_connection_timeout_secs")]
     pub http_connection_timeout_secs: u64,
+
+    /// Path validation timeout in milliseconds (default: 30000ms = 30 seconds)
+    /// Increase for slow network filesystems (NFS, SMB, S3FS)
+    #[serde(default = "default_path_validation_timeout_ms")]
+    pub path_validation_timeout_ms: u64,
 
     /// Currently connected client (if any)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,6 +127,7 @@ impl Default for ServerConfig {
             file_write_line_limit: 50,
             fuzzy_search_threshold: 0.7,
             http_connection_timeout_secs: 5,
+            path_validation_timeout_ms: 30_000,
             current_client: None,
             client_history: Vec::new(),
             system_info: get_system_info(),
@@ -272,6 +282,11 @@ impl ConfigManager {
     }
 
     #[must_use]
+    pub fn get_path_validation_timeout_ms(&self) -> u64 {
+        self.config.read().path_validation_timeout_ms
+    }
+
+    #[must_use]
     pub fn get_value(&self, key: &str) -> Option<ConfigValue> {
         let config = self.config.read();
         match key {
@@ -290,6 +305,9 @@ impl ConfigManager {
             )),
             "http_connection_timeout_secs" => Some(ConfigValue::Number(
                 i64::try_from(config.http_connection_timeout_secs).unwrap_or(i64::MAX),
+            )),
+            "path_validation_timeout_ms" => Some(ConfigValue::Number(
+                i64::try_from(config.path_validation_timeout_ms).unwrap_or(i64::MAX),
             )),
             _ => None,
         }
@@ -360,6 +378,24 @@ impl ConfigManager {
                     config.http_connection_timeout_secs = u64::try_from(num).map_err(|_| {
                         McpError::InvalidArguments(
                             "http_connection_timeout_secs value out of range".to_string(),
+                        )
+                    })?;
+                }
+                "path_validation_timeout_ms" => {
+                    let num = value.into_number().map_err(McpError::InvalidArguments)?;
+                    if num <= 0 {
+                        return Err(McpError::InvalidArguments(
+                            "path_validation_timeout_ms must be positive".to_string(),
+                        ));
+                    }
+                    if num > 600_000 {
+                        return Err(McpError::InvalidArguments(
+                            "path_validation_timeout_ms cannot exceed 600000ms (10 minutes)".to_string(),
+                        ));
+                    }
+                    config.path_validation_timeout_ms = u64::try_from(num).map_err(|_| {
+                        McpError::InvalidArguments(
+                            "path_validation_timeout_ms value out of range".to_string(),
                         )
                     })?;
                 }
