@@ -1,2 +1,0 @@
-    Checking kodegen_tools_config v0.1.3 (/Users/davidmaple/kodegen-workspace/kodegen-tools-config)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.07s
