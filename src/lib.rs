@@ -145,7 +145,6 @@ pub async fn start_server(
     tls_cert: Option<std::path::PathBuf>,
     tls_key: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    use anyhow::Result;
     use rmcp::handler::server::router::{prompt::PromptRouter, tool::ToolRouter};
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, StreamableHttpServerConfig,
