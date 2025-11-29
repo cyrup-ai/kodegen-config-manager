@@ -2,6 +2,7 @@ use crate::config_model::ServerConfig;
 use crate::env_loader::{load_allowed_dirs_from_env, load_denied_dirs_from_env};
 use crate::persistence;
 use crate::system_info::ClientInfo;
+use kodegen_config::KodegenConfig;
 use kodegen_mcp_tool::error::McpError;
 use kodegen_mcp_schema::config::ConfigValue;
 use parking_lot::RwLock;
@@ -24,11 +25,9 @@ pub struct ConfigManager {
 impl ConfigManager {
     #[must_use]
     pub fn new() -> Self {
-        let config_dir = match dirs::home_dir() {
-            Some(home) => home.join(".kodegen"),
-            None => PathBuf::from(".kodegen"),
-        };
-        let config_path = config_dir.join("config.json");
+        let config_path = KodegenConfig::user_config_dir()
+            .map(|dir| dir.join("config.json"))
+            .unwrap_or_else(|_| PathBuf::from(".kodegen/config.json"));
 
         // Create channel for debounced saves
         let (save_sender, save_receiver) = tokio::sync::mpsc::unbounded_channel();
