@@ -1,6 +1,6 @@
 [package]
 name = "kodegen_config_manager"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Configuration management infrastructure for MCP tool servers."
 authors = ["KODEGEN.ᴀɪ"]
@@ -13,9 +13,9 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 # Core KODEGEN dependencies
-kodegen_config = { version = "0.5" }
-kodegen_mcp_tool = { version = "0.5" }
-kodegen_mcp_schema = { version = "0.5" }
+kodegen_config = { version = "0.6" }
+kodegen_mcp_tool = { version = "0.6" }
+kodegen_mcp_schema = { version = "0.6" }
 
 # MCP protocol types (for ClientInfo)
 rmcp = { version = "0.10", features = ["schemars"] }
