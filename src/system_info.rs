@@ -1,51 +1,7 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SystemInfo {
-    /// Operating system family ("macos", "linux", "windows", etc.)
-    pub platform: String,
-
-    /// CPU architecture ("`x86_64`", "`aarch64`", "`arm`", etc.)
-    pub arch: String,
-
-    /// OS version string (e.g., "macOS 14.6", "Ubuntu 22.04")
-    pub os_version: String,
-
-    /// Kernel version (e.g., "23.6.0" for macOS, "6.5.0-1" for Linux)
-    pub kernel_version: String,
-
-    /// Machine hostname
-    pub hostname: String,
-
-    /// Kodegen server version from Cargo.toml
-    pub rust_version: String,
-
-    /// Number of logical CPU cores
-    pub cpu_count: usize,
-
-    /// Memory information
-    pub memory: MemoryInfo,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MemoryInfo {
-    pub total_mb: String,
-    pub available_mb: String,
-    pub used_mb: String,
-}
-
-// Re-export rmcp's Implementation type as ClientInfo for API compatibility
-pub use rmcp::model::Implementation as ClientInfo;
-
-/// Client connection record with timestamp tracking
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClientRecord {
-    pub client_info: ClientInfo,
-    pub connected_at: DateTime<Utc>,
-    pub last_seen: DateTime<Utc>,
-}
+// Re-export types from mcp-schema (canonical definitions)
+pub use kodegen_mcp_schema::config::{SystemInfo, MemoryInfo, ClientInfo, ClientRecord};
 
 /// Get current system information
 ///
