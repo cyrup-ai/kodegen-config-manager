@@ -1,5 +1,5 @@
 use crate::config_model::ServerConfig;
-use kodegen_mcp_tool::error::McpError;
+use kodegen_mcp_schema::McpError;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
