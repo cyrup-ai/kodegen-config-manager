@@ -1,6 +1,6 @@
 [package]
 name = "kodegen_config_manager"
-version = "0.10.4"
+version = "0.10.5"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Configuration management infrastructure for MCP tool servers."
 authors = ["KODEGEN.ᴀɪ"]
@@ -44,6 +44,10 @@ parking_lot = "0.12"
 
 # Logging
 log = "0.4"
+
+# File watching with debouncing
+notify = "6.1"
+notify-debouncer-mini = "0.4"
 
 [lib]
 name = "kodegen_config_manager"

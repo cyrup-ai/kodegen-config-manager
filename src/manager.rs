@@ -2,6 +2,7 @@ use crate::config_model::ServerConfig;
 use crate::env_loader::{load_allowed_dirs_from_env, load_denied_dirs_from_env};
 use crate::persistence;
 use crate::system_info::ClientInfo;
+use crate::watcher::ConfigWatcher;
 use crate::ConfigValueExt;
 use kodegen_config::KodegenConfig;
 use kodegen_mcp_schema::McpError;
@@ -9,6 +10,7 @@ use kodegen_mcp_schema::config::ConfigValue;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
+use anyhow::anyhow;
 
 // ============================================================================
 // CONFIG MANAGER
@@ -21,6 +23,9 @@ pub struct ConfigManager {
 
     // Debouncing field for fire-and-forget saves
     save_sender: tokio::sync::mpsc::UnboundedSender<()>,
+    
+    // Optional file watcher for automatic config reload
+    watcher: Option<Arc<ConfigWatcher>>,
 }
 
 impl ConfigManager {
@@ -46,6 +51,7 @@ impl ConfigManager {
             config,
             config_path,
             save_sender,
+            watcher: None,
         }
     }
 
@@ -86,6 +92,87 @@ impl ConfigManager {
 
         *self.config.write() = loaded_config;
         persistence::save_to_disk(&self.config, &self.config_path).await?;
+        Ok(())
+    }
+
+    /// Reload configuration from disk
+    ///
+    /// Re-reads the config file and updates in-memory state.
+    /// Environment variable overrides (KODEGEN_ALLOWED_DIRS, KODEGEN_DENIED_DIRS)
+    /// are preserved and re-applied after loading.
+    ///
+    /// # Errors
+    /// Returns error if config file cannot be read or parsed
+    pub async fn reload(&self) -> Result<(), McpError> {
+        log::info!("Reloading configuration from {:?}", self.config_path);
+        
+        // Read from disk
+        let content = tokio::fs::read_to_string(&self.config_path).await?;
+        let mut loaded_config = serde_json::from_str::<ServerConfig>(&content)?;
+        
+        // PRESERVE environment variable overrides (security critical)
+        let env_allowed = load_allowed_dirs_from_env();
+        let env_denied = load_denied_dirs_from_env();
+        
+        if !env_allowed.is_empty() {
+            loaded_config.allowed_directories = env_allowed;
+            log::info!(
+                "Preserved {} allowed directories from KODEGEN_ALLOWED_DIRS",
+                loaded_config.allowed_directories.len()
+            );
+        }
+        
+        if !env_denied.is_empty() {
+            loaded_config.denied_directories = env_denied;
+            log::info!(
+                "Preserved {} denied directories from KODEGEN_DENIED_DIRS",
+                loaded_config.denied_directories.len()
+            );
+        }
+        
+        // Update in-memory config
+        *self.config.write() = loaded_config;
+        
+        log::info!("Configuration reloaded successfully");
+        Ok(())
+    }
+
+    /// Enable automatic config file watching
+    ///
+    /// Starts monitoring the config file for changes. When changes are detected
+    /// (after 1-second debounce), automatically calls `reload()`.
+    ///
+    /// This is optional and should be enabled via CLI flag (e.g., `--watch-config`).
+    ///
+    /// # Errors
+    /// Returns error if file watching cannot be initialized
+    pub async fn enable_file_watching(&mut self) -> Result<(), McpError> {
+        if self.watcher.is_some() {
+            log::warn!("File watching already enabled");
+            return Ok(());
+        }
+        
+        // Create reload channel
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        // Start file watcher
+        let watcher = ConfigWatcher::new(self.config_path.clone(), reload_tx)
+            .map_err(|e| McpError::Other(anyhow!("Failed to start file watcher: {}", e)))?;
+        
+        self.watcher = Some(Arc::new(watcher));
+        
+        // Spawn background task to handle reload signals
+        let config_manager = self.clone();
+        tokio::spawn(async move {
+            while reload_rx.recv().await.is_some() {
+                if let Err(e) = config_manager.reload().await {
+                    log::error!("Config reload failed: {}", e);
+                    // Continue running with old config (fail-safe)
+                }
+            }
+        });
+        
+        log::info!("Config file watching enabled");
         Ok(())
     }
 

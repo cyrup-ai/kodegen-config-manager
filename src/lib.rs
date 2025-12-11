@@ -3,6 +3,7 @@ mod env_loader;
 mod manager;
 mod persistence;
 pub mod system_info;
+mod watcher;
 
 pub use config_model::ServerConfig;
 pub use kodegen_mcp_schema::config::ConfigValue;
