@@ -1,6 +1,6 @@
 [package]
 name = "kodegen_config_manager"
-version = "0.10.8"
+version = "0.10.9"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Configuration management infrastructure for MCP tool servers."
 authors = ["KODEGEN.ᴀɪ"]
@@ -33,6 +33,9 @@ thiserror = "2"
 # Process management
 sysinfo = "0.37"
 
+# Shell detection
+which = "6.0"
+
 # Cross-platform compatibility
 dirs = "6"
 
@@ -44,6 +47,9 @@ parking_lot = "0.12"
 
 # Logging
 log = "0.4"
+
+# Temporary file handling for atomic writes
+tempfile = "3"
 
 # File watching with debouncing
 notify = "6.1"

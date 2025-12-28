@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use rmcp::schemars::{self, JsonSchema};
-pub use kodegen_mcp_schema::config::{SystemInfo, MemoryInfo, ClientInfo, ClientRecord};
+pub use kodegen_mcp_schema::config::{SystemInfo, ClientInfo, ClientRecord};
 
 // ============================================================================
 // SERVER CONFIGURATION
@@ -11,6 +11,10 @@ pub use kodegen_mcp_schema::config::{SystemInfo, MemoryInfo, ClientInfo, ClientR
 /// Complete server configuration with security settings, resource limits, and diagnostics
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerConfig {
+    /// Schema version for migration (increment when format changes)
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
     /// Commands that cannot be executed
     #[serde(default)]
     pub blocked_commands: Vec<String>,
@@ -55,7 +59,13 @@ pub struct ServerConfig {
     #[serde(default)]
     pub client_history: Vec<ClientRecord>,
 
-    /// System diagnostic information (refreshed on every get_config call)
+    /// System diagnostic information (RUNTIME ONLY - not persisted)
+    ///
+    /// This is automatically refreshed on every `get_config()` call to provide
+    /// current system state. Never saved to disk.
+    ///
+    /// See: [`crate::system_info::get_system_info()`]
+    #[serde(skip, default = "crate::system_info::get_system_info")]
     pub system_info: SystemInfo,
 
     /// Total config save failures since server start
@@ -64,12 +74,12 @@ pub struct ServerConfig {
 }
 
 // Default value functions for serde
+fn default_schema_version() -> u32 {
+    1  // Current version
+}
+
 fn default_shell() -> String {
-    if cfg!(windows) {
-        "powershell.exe".to_string()
-    } else {
-        "/bin/bash".to_string()
-    }
+    crate::shell_detection::detect_user_shell()
 }
 
 fn default_file_read_limit() -> usize {
@@ -92,9 +102,91 @@ fn default_path_timeout() -> u64 {
     5000
 }
 
+impl ServerConfig {
+    /// Current schema version (update when format changes)
+    pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+    
+    /// Validate config values after deserialization
+    ///
+    /// Called during load to catch invalid configs early.
+    /// Fixes some issues automatically (auto-repair), fails on unrecoverable errors.
+    ///
+    /// # Auto-Repair (with warnings)
+    /// - Empty shell → detect user's shell
+    /// - Non-existent shell → detect user's shell
+    ///
+    /// # Hard Failures (returns Err)
+    /// - Zero limits (file_read_line_limit, file_write_line_limit)
+    /// - Invalid fuzzy threshold (<0.0 or >1.0)
+    /// - Zero timeouts
+    /// - Empty paths in allowed/denied directories
+    pub fn validate_and_repair(&mut self) -> Result<(), String> {
+        let mut warnings = Vec::new();
+        
+        // 1. Validate and fix shell
+        if self.default_shell.is_empty() {
+            warnings.push("default_shell is empty, auto-detecting".to_string());
+            self.default_shell = crate::shell_detection::detect_user_shell();
+        } else if let Err(e) = crate::shell_detection::validate_shell_path(&self.default_shell) {
+            warnings.push(format!(
+                "default_shell validation failed ({}), auto-detecting",
+                e
+            ));
+            self.default_shell = crate::shell_detection::detect_user_shell();
+        }
+        
+        // 2. Validate file limits (MUST be positive)
+        if self.file_read_line_limit == 0 {
+            return Err("file_read_line_limit cannot be zero".to_string());
+        }
+        
+        if self.file_write_line_limit == 0 {
+            return Err("file_write_line_limit cannot be zero".to_string());
+        }
+        
+        // 3. Validate fuzzy threshold (MUST be 0.0-1.0)
+        if !(0.0..=1.0).contains(&self.fuzzy_search_threshold) {
+            return Err(format!(
+                "fuzzy_search_threshold must be 0.0-1.0, got {}",
+                self.fuzzy_search_threshold
+            ));
+        }
+        
+        // 4. Validate timeouts (MUST be positive)
+        if self.http_connection_timeout_secs == 0 {
+            return Err("http_connection_timeout_secs cannot be zero".to_string());
+        }
+        
+        if self.path_validation_timeout_ms == 0 {
+            return Err("path_validation_timeout_ms cannot be zero".to_string());
+        }
+        
+        // 5. Validate directory paths (NO empty strings allowed)
+        for dir in &self.allowed_directories {
+            if dir.is_empty() {
+                return Err("allowed_directories contains empty path".to_string());
+            }
+        }
+        
+        for dir in &self.denied_directories {
+            if dir.is_empty() {
+                return Err("denied_directories contains empty path".to_string());
+            }
+        }
+        
+        // Log warnings for auto-repairs
+        for warning in warnings {
+            log::warn!("Config validation: {}", warning);
+        }
+        
+        Ok(())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            schema_version: ServerConfig::CURRENT_SCHEMA_VERSION,
             blocked_commands: Vec::new(),
             default_shell: default_shell(),
             allowed_directories: Vec::new(),
@@ -106,20 +198,8 @@ impl Default for ServerConfig {
             path_validation_timeout_ms: default_path_timeout(),
             current_client: None,
             client_history: Vec::new(),
-            system_info: SystemInfo {
-                platform: String::new(),
-                arch: String::new(),
-                os_version: String::new(),
-                kernel_version: String::new(),
-                hostname: String::new(),
-                rust_version: String::new(),
-                cpu_count: 0,
-                memory: MemoryInfo {
-                    total_mb: String::from("0 MB"),
-                    available_mb: String::from("0 MB"),
-                    used_mb: String::from("0 MB"),
-                },
-            },
+            // CHANGED: Call actual system info function instead of empty defaults
+            system_info: crate::system_info::get_system_info(),
             save_error_count: 0,
         }
     }

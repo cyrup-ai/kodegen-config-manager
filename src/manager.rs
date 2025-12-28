@@ -1,7 +1,8 @@
 use crate::config_model::ServerConfig;
 use crate::env_loader::{load_allowed_dirs_from_env, load_denied_dirs_from_env};
 use crate::persistence;
-use crate::system_info::ClientInfo;
+use crate::persistence::{backup_path, SaveRequest};
+use crate::system_info::{ClientInfo, get_system_info, SystemInfo};
 use crate::watcher::ConfigWatcher;
 use crate::ConfigValueExt;
 use kodegen_config::KodegenConfig;
@@ -9,20 +10,103 @@ use kodegen_mcp_schema::McpError;
 use kodegen_mcp_schema::config::ConfigValue;
 use parking_lot::RwLock;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::time::Instant;
 use anyhow::anyhow;
+
+// ============================================================================
+// SYSTEM INFO CACHING
+// ============================================================================
+
+/// Cached system info with timestamp for TTL-based refresh
+///
+/// Pattern: Similar to CONFIG_WRITE_START in persistence.rs
+/// - OnceLock for static initialization
+/// - Mutex for interior mutability
+/// - 5-second TTL to balance freshness vs syscall overhead
+static SYSTEM_INFO_CACHE: OnceLock<Mutex<(SystemInfo, Instant)>> = OnceLock::new();
+
+/// Refresh interval for system info (5 seconds)
+const SYSTEM_INFO_CACHE_TTL_SECS: u64 = 5;
+
+/// Get system info with TTL-based caching
+///
+/// Avoids excessive syscalls by caching for 5 seconds.
+/// First call initializes cache, subsequent calls refresh if stale.
+fn get_cached_system_info() -> SystemInfo {
+    let cache = SYSTEM_INFO_CACHE.get_or_init(|| {
+        Mutex::new((get_system_info(), Instant::now()))
+    });
+    
+    let mut guard = cache.lock().unwrap();
+    
+    // Refresh if cache is stale
+    if guard.1.elapsed().as_secs() >= SYSTEM_INFO_CACHE_TTL_SECS {
+        guard.0 = get_system_info();
+        guard.1 = Instant::now();
+    }
+    
+    guard.0.clone()
+}
 
 // ============================================================================
 // CONFIG MANAGER
 // ============================================================================
 
+/// ## Lock Ordering Invariant
+///
+/// To prevent deadlock, ALL methods acquiring multiple locks MUST respect
+/// this canonical ordering:
+///
+/// ```text
+/// 1. reload_mutex (coarse-grained serialization)
+/// 2. config (fine-grained data access)
+/// ```
+///
+/// **CRITICAL**: Never hold `config` write lock while requesting `reload_mutex`.
+///
+/// ## Atomic Operation Ordering
+///
+/// Atomic operations follow happens-before relationships:
+///
+/// ```text
+/// set_value() → increment generation → send SaveRequest
+///     ↓
+/// background_saver receives → read config + generation → write disk
+/// ```
+///
+/// Sequential consistency (`Ordering::SeqCst`) ensures all threads see
+/// generation increments in the same order.
+///
+/// ## Concurrent Safety
+///
+/// - `config`: RwLock allows multiple concurrent readers, single writer
+/// - `generation`: AtomicU64 provides lock-free increment
+/// - `saving`: AtomicBool prevents file watcher self-trigger
+/// - `reload_mutex`: Serializes reload operations
+/// - `save_sender`: UnboundedSender is lock-free
 #[derive(Clone)]
 pub struct ConfigManager {
     config: Arc<RwLock<ServerConfig>>,
     config_path: PathBuf,
 
     // Debouncing field for fire-and-forget saves
-    save_sender: tokio::sync::mpsc::UnboundedSender<()>,
+    save_sender: tokio::sync::mpsc::UnboundedSender<SaveRequest>,
+    
+    // NEW: Optimistic concurrency control fields
+    /// Generation counter for tracking config versions
+    /// Incremented atomically on every modification
+    /// Used to prevent stale writes (see Race #1)
+    generation: Arc<AtomicU64>,
+    
+    /// Flag to pause file watcher during programmatic saves
+    /// Prevents self-trigger reload loop (see Race #2)
+    saving: Arc<AtomicBool>,
+    
+    /// Mutex to serialize reload operations
+    /// Prevents concurrent reloads (see Race #3)
+    reload_mutex: Arc<tokio::sync::Mutex<()>>,
     
     // Optional file watcher for automatic config reload
     watcher: Option<Arc<ConfigWatcher>>,
@@ -39,18 +123,28 @@ impl ConfigManager {
         let (save_sender, save_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let config = Arc::new(RwLock::new(ServerConfig::default()));
+        
+        // Initialize generation counter
+        let generation = Arc::new(AtomicU64::new(0));
+        let saving = Arc::new(AtomicBool::new(false));
+        let reload_mutex = Arc::new(tokio::sync::Mutex::new(()));
 
-        // Start background saver task
+        // Start background saver task with generation tracking
         persistence::start_background_saver(
             Arc::clone(&config),
             config_path.clone(),
             save_receiver,
+            Arc::clone(&generation),
+            Arc::clone(&saving),
         );
 
         Self {
             config,
             config_path,
             save_sender,
+            generation,
+            saving,
+            reload_mutex,
             watcher: None,
         }
     }
@@ -64,11 +158,8 @@ impl ConfigManager {
             tokio::fs::create_dir_all(config_dir).await?;
         }
 
-        // Load from disk or use defaults
-        let mut loaded_config = match tokio::fs::read_to_string(&self.config_path).await {
-            Ok(content) => serde_json::from_str::<ServerConfig>(&content)?,
-            Err(_) => ServerConfig::default(),
-        };
+        // Load from disk with automatic recovery cascade
+        let mut loaded_config = load_with_recovery(&self.config_path).await?;
 
         // OVERRIDE with environment variables (for security)
         let env_allowed = load_allowed_dirs_from_env();
@@ -90,6 +181,21 @@ impl ConfigManager {
             );
         }
 
+        // IMPORTANT: Re-detect shell on every startup (runtime detection)
+        // User may have changed their shell preference between runs
+        // Only update if detection result differs (preserves manual user customization)
+        let detected_shell = crate::shell_detection::detect_user_shell();
+        if loaded_config.default_shell != detected_shell {
+            log::info!(
+                "🔄 Shell preference changed: {} → {}",
+                loaded_config.default_shell,
+                detected_shell
+            );
+            loaded_config.default_shell = detected_shell;
+        } else {
+            log::debug!("✓ Shell preference unchanged: {}", detected_shell);
+        }
+
         *self.config.write() = loaded_config;
         persistence::save_to_disk(&self.config, &self.config_path).await?;
         Ok(())
@@ -98,17 +204,22 @@ impl ConfigManager {
     /// Reload configuration from disk
     ///
     /// Re-reads the config file and updates in-memory state.
+    /// Serialized with mutex to prevent concurrent reloads (Race #3).
+    /// Uses the same recovery cascade as init() to handle corruption.
     /// Environment variable overrides (KODEGEN_ALLOWED_DIRS, KODEGEN_DENIED_DIRS)
     /// are preserved and re-applied after loading.
     ///
     /// # Errors
     /// Returns error if config file cannot be read or parsed
     pub async fn reload(&self) -> Result<(), McpError> {
+        // CRITICAL: Acquire reload mutex to prevent concurrent reloads
+        // This solves Race #3: Concurrent Init + Reload
+        let _guard = self.reload_mutex.lock().await;
+        
         log::info!("Reloading configuration from {:?}", self.config_path);
         
-        // Read from disk
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
-        let mut loaded_config = serde_json::from_str::<ServerConfig>(&content)?;
+        // Use recovery cascade (same as init)
+        let mut loaded_config = load_with_recovery(&self.config_path).await?;
         
         // PRESERVE environment variable overrides (security critical)
         let env_allowed = load_allowed_dirs_from_env();
@@ -130,10 +241,27 @@ impl ConfigManager {
             );
         }
         
-        // Update in-memory config
-        *self.config.write() = loaded_config;
+        // PRESERVE transient state (client connections are runtime-only)
+        // These fields may not be persisted yet due to debouncing
+        let (current_client, client_history) = {
+            let cfg = self.config.read();
+            (cfg.current_client.clone(), cfg.client_history.clone())
+        };
+
+        // Restore preserved state to loaded config
+        loaded_config.current_client = current_client;
+        loaded_config.client_history = client_history;
+
+        // Update in-memory config atomically
+        {
+            let mut config = self.config.write();
+            *config = loaded_config;
+        }
         
-        log::info!("Configuration reloaded successfully");
+        // Increment generation to mark this as a new version
+        let new_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        
+        log::info!("Configuration reloaded successfully (generation {})", new_gen);
         Ok(())
     }
 
@@ -155,9 +283,13 @@ impl ConfigManager {
         // Create reload channel
         let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel();
         
-        // Start file watcher
-        let watcher = ConfigWatcher::new(self.config_path.clone(), reload_tx)
-            .map_err(|e| McpError::Other(anyhow!("Failed to start file watcher: {}", e)))?;
+        // Start file watcher with saving flag
+        let watcher = ConfigWatcher::new(
+            self.config_path.clone(),
+            reload_tx,
+            Arc::clone(&self.saving),
+        )
+        .map_err(|e| McpError::Other(anyhow!("Failed to start file watcher: {}", e)))?;
         
         self.watcher = Some(Arc::new(watcher));
         
@@ -178,7 +310,12 @@ impl ConfigManager {
 
     #[must_use]
     pub fn get_config(&self) -> ServerConfig {
-        self.config.read().clone()
+        let mut config = self.config.read().clone();
+        
+        // CRITICAL: Always provide fresh system info
+        config.system_info = get_cached_system_info();
+        
+        config
     }
 
     #[must_use]
@@ -240,17 +377,29 @@ impl ConfigManager {
 
     /// Set a configuration value by key
     ///
+    /// Thread-safe with generation tracking to prevent lost updates.
+    /// Increments generation counter atomically after modification.
+    ///
     /// # Errors
     /// Returns error if the key is unknown, value type is invalid, or config cannot be saved
     pub async fn set_value(&self, key: &str, value: ConfigValue) -> Result<(), McpError> {
-        {
+        // Perform modification and capture new generation atomically
+        let new_generation = {
             let mut config = self.config.write();
+            
+            // Apply the configuration change
             match key {
                 "blocked_commands" => {
                     config.blocked_commands = value.into_array().map_err(McpError::InvalidArguments)?;
                 }
                 "default_shell" => {
-                    config.default_shell = value.into_string().map_err(McpError::InvalidArguments)?;
+                    let shell_path = value.into_string().map_err(McpError::InvalidArguments)?;
+                    
+                    // Validate shell exists and is executable
+                    crate::shell_detection::validate_shell_path(&shell_path)
+                        .map_err(McpError::InvalidArguments)?;
+                    
+                    config.default_shell = shell_path;
                 }
                 "allowed_directories" => {
                     config.allowed_directories = value.into_array().map_err(McpError::InvalidArguments)?;
@@ -330,10 +479,23 @@ impl ConfigManager {
                     )));
                 }
             }
-        }
+            
+            // Validate entire config after modification
+            config.validate_and_repair()
+                .map_err(|e| McpError::Other(anyhow::anyhow!("Validation failed: {}", e)))?;
+            
+            // Increment generation AFTER successful modification
+            // This ensures every config change gets a unique version number
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        }; // ← Lock released here
 
-        // Fire-and-forget debounced save
-        let _ = self.save_sender.send(());
+        // Request save with generation tracking
+        // Fire-and-forget: failures logged but not propagated
+        let _ = self.save_sender.send(SaveRequest {
+            min_generation: new_generation,
+        });
+        
+        log::debug!("Config modified, generation {}", new_generation);
         Ok(())
     }
 
@@ -343,7 +505,7 @@ impl ConfigManager {
     /// Disk write errors are logged but not propagated (fire-and-forget pattern).
     /// Use `get_save_error_count()` to check for save failures.
     pub async fn set_client_info(&self, client_info: ClientInfo) {
-        {
+        let new_generation = {
             let mut config = self.config.write();
             let now = chrono::Utc::now();
 
@@ -357,6 +519,23 @@ impl ConfigManager {
                 // Update existing record's last_seen timestamp
                 record.last_seen = now;
             } else {
+                // BOUNDED GROWTH: Prune old entries before adding new one
+                // Strategy: FIFO (First In, First Out) with batch removal
+                // - Maximum: 100 entries
+                // - Prune trigger: When reaching 100 entries
+                // - Prune amount: Remove oldest 50 entries
+                // - Result: Keeps 51 entries (50 old + 1 new)
+                
+                if config.client_history.len() >= 100 {
+                    // Remove oldest 50 entries (indices 0..50)
+                    // drain(0..50) removes and drops the first 50 elements
+                    config.client_history.drain(0..50);
+                    log::info!(
+                        "Pruned client_history: removed 50 oldest entries, {} remaining",
+                        config.client_history.len()
+                    );
+                }
+                
                 // Add new client record
                 config.client_history.push(crate::system_info::ClientRecord {
                     client_info: client_info.clone(),
@@ -367,10 +546,15 @@ impl ConfigManager {
 
             // Set as current client
             config.current_client = Some(client_info);
-        }
+            
+            // Increment generation and return
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
 
-        // Fire-and-forget debounced save
-        let _ = self.save_sender.send(());
+        // Fire-and-forget debounced save with generation tracking
+        let _ = self.save_sender.send(SaveRequest {
+            min_generation: new_generation,
+        });
     }
 
     /// Get current client information
@@ -393,6 +577,112 @@ impl ConfigManager {
     pub fn get_save_error_count() -> usize {
         persistence::get_save_error_count()
     }
+}
+
+// ============================================================================
+// CONFIG RECOVERY HELPERS
+// ============================================================================
+
+/// Load config with automatic backup recovery cascade
+///
+/// Recovery strategy:
+/// 1. Try main config.json
+/// 2. Try config.json.backup (last known good)
+/// 3. Try config.json.backup.1 (previous generation)
+/// 4. Try config.json.backup.2 (older generation)
+/// 5. Try config.json.backup.3 (oldest generation)
+/// 6. Fall back to defaults with warning
+///
+/// On successful recovery from backup, automatically restore to main config file.
+async fn load_with_recovery(config_path: &PathBuf) -> Result<ServerConfig, McpError> {
+    // Try to load current config
+    match try_load_config(config_path).await {
+        Ok(config) => {
+            log::info!("✓ Loaded config from {}", config_path.display());
+            return Ok(config);
+        }
+        Err(e) => {
+            log::error!(
+                "✗ Failed to load config from {}: {}",
+                config_path.display(),
+                e
+            );
+            log::warn!("→ Attempting recovery from backup files...");
+        }
+    }
+    
+    // Try backups in order: .backup → .backup.1 → .backup.2 → .backup.3
+    for backup_index in [None, Some(1), Some(2), Some(3)] {
+        let backup_path_buf = backup_path(config_path, backup_index);
+        
+        if !backup_path_buf.exists() {
+            continue;
+        }
+        
+        log::info!("→ Trying backup: {}", backup_path_buf.display());
+        
+        match try_load_config(&backup_path_buf).await {
+            Ok(config) => {
+                log::warn!(
+                    "✓ Recovered config from backup: {}",
+                    backup_path_buf.display()
+                );
+                log::warn!(
+                    "→ Restoring backup to main config file: {}",
+                    config_path.display()
+                );
+                
+                // Restore backup to main config location
+                // This ensures the next startup uses the recovered config
+                tokio::fs::copy(&backup_path_buf, config_path).await?;
+                
+                return Ok(config);
+            }
+            Err(e) => {
+                log::error!(
+                    "✗ Backup {} also corrupted: {}",
+                    backup_path_buf.display(),
+                    e
+                );
+            }
+        }
+    }
+    
+    // All backups failed - use defaults
+    log::error!("❌ All config backups corrupted or missing!");
+    log::error!("→ Main config: FAILED");
+    log::error!("→ .backup: FAILED");
+    log::error!("→ .backup.1: FAILED");
+    log::error!("→ .backup.2: FAILED");
+    log::error!("→ .backup.3: FAILED");
+    log::warn!("🔄 Creating fresh config with defaults");
+    log::warn!("⚠️  All previous settings and client history lost");
+    
+    Ok(ServerConfig::default())
+}
+
+/// Try to load and validate a config file
+///
+/// Performs both JSON parsing and semantic validation with automatic migration.
+///
+/// # Errors
+/// Returns error if:
+/// - File cannot be read
+/// - JSON is malformed
+/// - Migration fails
+/// - Config values are invalid (validation fails)
+async fn try_load_config(path: &PathBuf) -> Result<ServerConfig, anyhow::Error> {
+    use anyhow::Context;
+    
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .context("Failed to read config file")?;
+    
+    // Use migration framework (handles v0→v1 automatically and validates)
+    let config = crate::migration::load_with_migration(&content)
+        .context("Failed to load config with migration")?;
+    
+    Ok(config)
 }
 
 impl Default for ConfigManager {

@@ -1,13 +1,16 @@
 mod config_model;
 mod env_loader;
 mod manager;
+mod migration;
 mod persistence;
+mod shell_detection;
 pub mod system_info;
 mod watcher;
 
 pub use config_model::ServerConfig;
 pub use kodegen_mcp_schema::config::ConfigValue;
 pub use manager::ConfigManager;
+pub use shell_detection::{detect_user_shell, validate_shell_path};
 pub use system_info::get_system_info;
 
 /// Extension trait for ConfigValue providing conversion methods
